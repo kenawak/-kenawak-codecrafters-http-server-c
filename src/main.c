@@ -16,6 +16,18 @@ void send_response(int client_sock, const char *status) {
     write(client_sock, response, strlen(response));
 }
 
+// Case-insensitive string comparison
+int strncasecmp(const char *s1, const char *s2, size_t n) {
+    while (n-- && *s1 && *s2) {
+        if (tolower((unsigned char)*s1) != tolower((unsigned char)*s2)) {
+            return *s1 - *s2;
+        }
+        s1++;
+        s2++;
+    }
+    return 0;
+}
+
 // Handle POST /files/{filename}
 void handle_post(int client_sock, char *request, const char *directory) {
     // Parse request line
@@ -49,16 +61,16 @@ void handle_post(int client_sock, char *request, const char *directory) {
     char *header = strtok(request, "\r\n");
     header = strtok(NULL, "\r\n"); // Skip request line
     while (header) {
-        if (strncmp(header, "Content-Length: ", 15) == 0) {
+        if (strncasecmp(header, "Content-Length: ", 15) == 0) {
             content_length = atoi(header + 15);
-        } else if (strncmp(header, "Content-Type: ", 13) == 0) {
+        } else if (strncasecmp(header, "Content-Type: ", 13) == 0) {
             content_type = header + 13;
         }
         header = strtok(NULL, "\r\n");
     }
 
     // Validate Content-Type
-    if (!content_type || strcmp(content_type, "application/octet-stream") != 0) {
+    if (!content_type || strncasecmp(content_type, "application/octet-stream", 24) != 0) {
         send_response(client_sock, "400 Bad Request");
         return;
     }
@@ -81,23 +93,24 @@ void handle_post(int client_sock, char *request, const char *directory) {
     // Write body to file
     if (content_length > 0) {
         // Write initial body part
-        size_t body_len = strlen(body);
-        if (body_len > 0) {
-            write(fd, body, body_len);
+        size_t initial_body_len = strlen(body);
+        if (initial_body_len > 0) {
+            write(fd, body, initial_body_len);
         }
 
-        // Read remaining body if necessary
-        int remaining = content_length - body_len;
+        // Read remaining body
+        size_t total_written = initial_body_len;
         char buffer[BUFFER_SIZE];
-        while (remaining > 0) {
-            int bytes_read = read(client_sock, buffer, BUFFER_SIZE < remaining ? BUFFER_SIZE : remaining);
+        while (total_written < content_length) {
+            int bytes_to_read = BUFFER_SIZE < (content_length - total_written) ? BUFFER_SIZE : (content_length - total_written);
+            int bytes_read = read(client_sock, buffer, bytes_to_read);
             if (bytes_read <= 0) {
                 close(fd);
                 send_response(client_sock, "400 Bad Request");
                 return;
             }
             write(fd, buffer, bytes_read);
-            remaining -= bytes_read;
+            total_written += bytes_read;
         }
     }
 
@@ -183,6 +196,7 @@ int main(int argc, char *argv[]) {
             close(client_sock);
             continue;
         }
+        buffer[bytes_read] = '\0';
 
         // Handle POST request
         handle_post(client_sock, buffer, dir_with_slash);
