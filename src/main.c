@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ctype.h> // Added for tolower in strncasecmp
 
 #define BUFFER_SIZE 4096
 #define MAX_PATH 256
@@ -100,7 +101,7 @@ void handle_post(int client_sock, char *request, const char *directory) {
 
         // Read remaining body
         size_t total_written = initial_body_len;
-        char buffer[BUFFER_SIZE];
+        char buffer[  = {0};
         while (total_written < content_length) {
             int bytes_to_read = BUFFER_SIZE < (content_length - total_written) ? BUFFER_SIZE : (content_length - total_written);
             int bytes_read = read(client_sock, buffer, bytes_to_read);
