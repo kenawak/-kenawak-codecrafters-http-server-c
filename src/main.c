@@ -83,13 +83,25 @@ int main() {
         printf("Parsed request: Method=%s, Path=%s, Protocol=%s\n", method, path, protocol);
 
         // Prepare response
-        char response[512];
+        char response[1024];
         if (strcmp(path, "/") == 0) {
+            // Handle root path
             snprintf(response, sizeof(response),
                      "HTTP/1.1 200 OK\r\n"
                      "Content-Length: 0\r\n"
                      "\r\n");
+        } else if (strncmp(path, "/echo/", 6) == 0) {
+            // Handle /echo/{str}
+            char *echo_string = path + 6; // Skip "/echo/"
+            snprintf(response, sizeof(response),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/plain\r\n"
+                     "Content-Length: %ld\r\n"
+                     "\r\n"
+                     "%s",
+                     strlen(echo_string), echo_string);
         } else {
+            // Handle invalid paths
             snprintf(response, sizeof(response),
                      "HTTP/1.1 404 Not Found\r\n"
                      "Content-Length: 0\r\n"
