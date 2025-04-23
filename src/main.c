@@ -15,8 +15,14 @@ int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
-    // Get file directory from command-line argument
-    const char *file_dir = (argc > 1) ? argv[1] : ".";
+    // Parse --directory flag
+    const char *file_dir = ".";
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--directory") == 0) {
+            file_dir = argv[i + 1];
+            break;
+        }
+    }
     printf("Using file directory: %s\n", file_dir);
 
     printf("Logs from your program will appear here!\n");
