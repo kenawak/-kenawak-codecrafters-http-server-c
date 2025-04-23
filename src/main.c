@@ -1,260 +1,198 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
 #include <string.h>
-#include <errno.h>
 #include <unistd.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 
-int main(int argc, char *argv[]) {
-    // Disable output buffering
-    setbuf(stdout, NULL);
-    setbuf(stderr, NULL);
+#define BUFFER_SIZE 4096
+#define MAX_PATH 256
 
-    // Parse --directory flag
-    const char *file_dir = ".";
-    for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--directory") == 0) {
-            file_dir = argv[i + 1];
-            break;
+// Send HTTP response
+void send_response(int client_sock, const char *status) {
+    char response[BUFFER_SIZE];
+    snprintf(response, sizeof(response), "HTTP/1.1 %s\r\n\r\n", status);
+    write(client_sock, response, strlen(response));
+}
+
+// Handle POST /files/{filename}
+void handle_post(int client_sock, char *request, const char *directory) {
+    // Parse request line
+    char *method = strtok(request, " ");
+    char *path = strtok(NULL, " ");
+    if (!method || !path || strcmp(method, "POST") != 0 || strncmp(path, "/files/", 7) != 0) {
+        send_response(client_sock, "404 Not Found");
+        return;
+    }
+
+    // Extract filename
+    char *filename = path + 7;
+    if (strlen(filename) == 0) {
+        send_response(client_sock, "400 Bad Request");
+        return;
+    }
+
+    // Parse headers
+    int content_length = 0;
+    char *content_type = NULL;
+    char *body = strstr(request, "\r\n\r\n");
+    if (!body) {
+        send_response(client_sock, "400 Bad Request");
+        return;
+    }
+    body += 4; // Skip "\r\n\r\n"
+
+    // Read headers
+    char *header_end = body - 4;
+    *header_end = '\0';
+    char *header = strtok(request, "\r\n");
+    header = strtok(NULL, "\r\n"); // Skip request line
+    while (header) {
+        if (strncmp(header, "Content-Length: ", 15) == 0) {
+            content_length = atoi(header + 15);
+        } else if (strncmp(header, "Content-Type: ", 13) == 0) {
+            content_type = header + 13;
+        }
+        header = strtok(NULL, "\r\n");
+    }
+
+    // Validate Content-Type
+    if (!content_type || strcmp(content_type, "application/octet-stream") != 0) {
+        send_response(client_sock, "400 Bad Request");
+        return;
+    }
+
+    // Construct filepath
+    char filepath[MAX_PATH];
+    snprintf(filepath, sizeof(filepath), "%s%s", directory, filename);
+    if (strlen(filepath) >= MAX_PATH) {
+        send_response(client_sock, "400 Bad Request");
+        return;
+    }
+
+    // Create file
+    int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        send_response(client_sock, "500 Internal Server Error");
+        return;
+    }
+
+    // Write body to file
+    if (content_length > 0) {
+        // Write initial body part
+        size_t body_len = strlen(body);
+        if (body_len > 0) {
+            write(fd, body, body_len);
+        }
+
+        // Read remaining body if necessary
+        int remaining = content_length - body_len;
+        char buffer[BUFFER_SIZE];
+        while (remaining > 0) {
+            int bytes_read = read(client_sock, buffer, BUFFER_SIZE < remaining ? BUFFER_SIZE : remaining);
+            if (bytes_read <= 0) {
+                close(fd);
+                send_response(client_sock, "400 Bad Request");
+                return;
+            }
+            write(fd, buffer, bytes_read);
+            remaining -= bytes_read;
         }
     }
-    printf("Using file directory: %s\n", file_dir);
 
-    printf("Logs from your program will appear here!\n");
+    close(fd);
+    send_response(client_sock, "201 Created");
+}
+
+// Main server
+int main(int argc, char *argv[]) {
+    // Parse --directory flag
+    char *directory = "/tmp/";
+    if (argc > 2 && strcmp(argv[1], "--directory") == 0) {
+        directory = argv[2];
+    }
+
+    // Ensure directory ends with '/'
+    char *dir_with_slash = directory;
+    if (directory[strlen(directory) - 1] != '/') {
+        dir_with_slash = malloc(strlen(directory) + 2);
+        if (!dir_with_slash) {
+            perror("Memory allocation failed");
+            return 1;
+        }
+        sprintf(dir_with_slash, "%s/", directory);
+    }
 
     // Create socket
-    int server_fd, client_addr_len;
-    struct sockaddr_in client_addr;
-
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-        printf("Socket creation failed: %s...\n", strerror(errno));
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("Socket creation failed");
+        free(dir_with_slash == directory ? NULL : dir_with_slash);
         return 1;
     }
 
-    // Set SO_REUSEADDR
-    int reuse = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        printf("SO_REUSEADDR failed: %s \n", strerror(errno));
+    // Set socket options
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("Setsockopt failed");
+        close(server_fd);
+        free(dir_with_slash == directory ? NULL : dir_with_slash);
         return 1;
     }
 
     // Configure server address
-    struct sockaddr_in serv_addr = {
+    struct sockaddr_in server_addr = {
         .sin_family = AF_INET,
-        .sin_port = htons(4221),
-        .sin_addr = { htonl(INADDR_ANY) }
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port = htons(4221)
     };
 
-    // Bind socket
-    if (bind(server_fd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) != 0) {
-        printf("Bind failed: %s \n", strerror(errno));
+    // Bind
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        close(server_fd);
+        free(dir_with_slash == directory ? NULL : dir_with_slash);
         return 1;
     }
 
     // Listen
-    int connection_backlog = 5;
-    if (listen(server_fd, connection_backlog) != 0) {
-        printf("Listen failed: %s \n", strerror(errno));
+    if (listen(server_fd, 10) < 0) {
+        perror("Listen failed");
+        close(server_fd);
+        free(dir_with_slash == directory ? NULL : dir_with_slash);
         return 1;
     }
 
-    printf("Waiting for a client to connect...\n");
+    printf("Server listening on port 4221...\n");
 
+    // Main loop
     while (1) {
-        // Accept client
-        client_addr_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *) &client_addr, &client_addr_len);
-        if (client_fd < 0) {
-            printf("Accept failed: %s\n", strerror(errno));
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_sock = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_sock < 0) {
+            perror("Accept failed");
             continue;
         }
 
-        // Fork to handle client
-        pid_t pid = fork();
-        if (pid < 0) {
-            printf("Fork failed: %s\n", strerror(errno));
-            close(client_fd);
+        // Read request
+        char buffer[BUFFER_SIZE] = {0};
+        int bytes_read = read(client_sock, buffer, BUFFER_SIZE - 1);
+        if (bytes_read <= 0) {
+            close(client_sock);
             continue;
         }
 
-        if (pid == 0) {
-            // Child process: Handle client
-            close(server_fd); // Child doesn't need server socket
+        // Handle POST request
+        handle_post(client_sock, buffer, dir_with_slash);
 
-            printf("Client connected (PID: %d)\n", getpid());
-
-            // Read request
-            char buffer[1024] = {0};
-            if (read(client_fd, buffer, sizeof(buffer) - 1) < 0) {
-                printf("Read failed: %s\n", strerror(errno));
-                close(client_fd);
-                exit(1);
-            }
-
-            // Parse request line
-            char method[16], path[256], protocol[16];
-            if (sscanf(buffer, "%s %s %s", method, path, protocol) != 3) {
-                printf("Failed to parse request line\n");
-                close(client_fd);
-                exit(1);
-            }
-
-            printf("Parsed request: Method=%s, Path=%s, Protocol=%s\n", method, path, protocol);
-
-            // Parse headers to find User-Agent
-            char user_agent[256] = {0};
-            char *header_line = buffer;
-            while (header_line) {
-                header_line = strstr(header_line, "\r\n");
-                if (!header_line) break;
-                header_line += 2; // Skip \r\n
-                if (strncmp(header_line, "User-Agent: ", 12) == 0) {
-                    strncpy(user_agent, header_line + 12, sizeof(user_agent) - 1);
-                    // Remove trailing \r\n
-                    char *newline = strstr(user_agent, "\r\n");
-                    if (newline) *newline = '\0';
-                    break;
-                }
-            }
-
-            // Prepare response
-            char response[4096] = {0};
-            if (strcmp(path, "/") == 0) {
-                // Handle root path
-                snprintf(response, sizeof(response),
-                         "HTTP/1.1 200 OK\r\n"
-                         "Content-Length: 0\r\n"
-                         "\r\n");
-            } else if (strncmp(path, "/echo/", 6) == 0) {
-                // Handle /echo/{str}
-                char *echo_string = path + 6;
-                snprintf(response, sizeof(response),
-                         "HTTP/1.1 200 OK\r\n"
-                         "Content-Type: text/plain\r\n"
-                         "Content-Length: %ld\r\n"
-                         "\r\n"
-                         "%s",
-                         strlen(echo_string), echo_string);
-            } else if (strcmp(path, "/user-agent") == 0) {
-                // Handle /user-agent
-                if (user_agent[0] == '\0') {
-                    snprintf(response, sizeof(response),
-                             "HTTP/1.1 400 Bad Request\r\n"
-                             "Content-Length: 0\r\n"
-                             "\r\n");
-                } else {
-                    snprintf(response, sizeof(response),
-                             "HTTP/1.1 200 OK\r\n"
-                             "Content-Type: text/plain\r\n"
-                             "Content-Length: %ld\r\n"
-                             "\r\n"
-                             "%s",
-                             strlen(user_agent), user_agent);
-                }
-            } else if (strncmp(path, "/files/", 7) == 0) {
-                // Handle /files/{filename}
-                char *filename = path + 7; // Skip "/files/"
-                char filepath[512];
-                snprintf(filepath, sizeof(filepath), "%s/%s", file_dir, filename);
-                printf("Attempting to open file: %s\n", filepath);
-
-                // Open file
-                int file_fd = open(filepath, O_RDONLY);
-                if (file_fd < 0) {
-                    printf("File open failed: %s\n", strerror(errno));
-                    snprintf(response, sizeof(response),
-                             "HTTP/1.1 404 Not Found\r\n"
-                             "Content-Length: 0\r\n"
-                             "\r\n");
-                } else {
-                    // Get file size
-                    struct stat file_stat;
-                    if (fstat(file_fd, &file_stat) < 0) {
-                        printf("fstat failed: %s\n", strerror(errno));
-                        close(file_fd);
-                        snprintf(response, sizeof(response),
-                                 "HTTP/1.1 500 Internal Server Error\r\n"
-                                 "Content-Length: 0\r\n"
-                                 "\r\n");
-                    } else {
-                        off_t file_size = file_stat.st_size;
-                        if (file_size == 0) {
-                            // Handle empty file
-                            snprintf(response, sizeof(response),
-                                     "HTTP/1.1 200 OK\r\n"
-                                     "Content-Type: application/octet-stream\r\n"
-                                     "Content-Length: 0\r\n"
-                                     "\r\n");
-                            close(file_fd);
-                        } else {
-                            // Prepare headers
-                            snprintf(response, sizeof(response),
-                                     "HTTP/1.1 200 OK\r\n"
-                                     "Content-Type: application/octet-stream\r\n"
-                                     "Content-Length: %ld\r\n"
-                                     "\r\n",
-                                     file_size);
-                            // Send headers
-                            if (write(client_fd, response, strlen(response)) < 0) {
-                                printf("Write headers failed: %s\n", strerror(errno));
-                                close(file_fd);
-                                exit(1);
-                            }
-                            // Send file contents in chunks
-                            char chunk[4096];
-                            ssize_t bytes_read;
-                            while ((bytes_read = read(file_fd, chunk, sizeof(chunk))) > 0) {
-                                if (write(client_fd, chunk, bytes_read) < 0) {
-                                    printf("Write file content failed: %s\n", strerror(errno));
-                                    close(file_fd);
-                                    exit(1);
-                                }
-                            }
-                            if (bytes_read < 0) {
-                                printf("Read file failed: %s\n", strerror(errno));
-                                close(file_fd);
-                                snprintf(response, sizeof(response),
-                                         "HTTP/1.1 500 Internal Server Error\r\n"
-                                         "Content-Length: 0\r\n"
-                                         "\r\n");
-                            } else {
-                                response[0] = '\0'; // Clear response to skip final write
-                            }
-                            close(file_fd);
-                        }
-                    }
-                }
-            } else {
-                // Handle invalid paths
-                snprintf(response, sizeof(response),
-                         "HTTP/1.1 404 Not Found\r\n"
-                         "Content-Length: 0\r\n"
-                         "\r\n");
-            }
-
-            // Send response (if not already sent for /files/)
-            if (response[0] != '\0') {
-                if (write(client_fd, response, strlen(response)) < 0) {
-                    printf("Write failed: %s\n", strerror(errno));
-                }
-            }
-
-            // Close client and exit child
-            close(client_fd);
-            exit(0);
-        } else {
-            // Parent process: Close client socket and clean up zombies
-            close(client_fd);
-            while (waitpid(-1, NULL, WNOHANG) > 0);
-        }
+        // Close client socket
+        close(client_sock);
     }
 
+    // Cleanup
     close(server_fd);
+    free(dir_with_slash == directory ? NULL : dir_with_slash);
     return 0;
 }
