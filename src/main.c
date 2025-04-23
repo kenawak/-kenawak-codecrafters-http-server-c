@@ -6,6 +6,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 int main() {
     // Disable output buffering
@@ -62,92 +63,110 @@ int main() {
             continue;
         }
 
-        printf("Client connected\n");
-
-        // Read request
-        char buffer[1024] = {0};
-        if (read(client_fd, buffer, sizeof(buffer) - 1) < 0) {
-            printf("Read failed: %s\n", strerror(errno));
+        // Fork to handle client
+        pid_t pid = fork();
+        if (pid < 0) {
+            printf("Fork failed: %s\n", strerror(errno));
             close(client_fd);
             continue;
         }
 
-        // Parse request line
-        char method[16], path[256], protocol[16];
-        if (sscanf(buffer, "%s %s %s", method, path, protocol) != 3) {
-            printf("Failed to parse request line\n");
-            close(client_fd);
-            continue;
-        }
+        if (pid == 0) {
+            // Child process: Handle client
+            close(server_fd); // Child doesn't need server socket
 
-        printf("Parsed request: Method=%s, Path=%s, Protocol=%s\n", method, path, protocol);
+            printf("Client connected (PID: %d)\n", getpid());
 
-        // Parse headers to find User-Agent
-        char user_agent[256] = {0};
-        char *header_line = buffer;
-        while (header_line) {
-            header_line = strstr(header_line, "\r\n");
-            if (!header_line) break;
-            header_line += 2; // Skip \r\n
-            if (strncmp(header_line, "User-Agent: ", 12) == 0) {
-                strncpy(user_agent, header_line + 12, sizeof(user_agent) - 1);
-                // Remove trailing \r\n
-                char *newline = strstr(user_agent, "\r\n");
-                if (newline) *newline = '\0';
-                break;
+            // Read request
+            char buffer[1024] = {0};
+            if (read(client_fd, buffer, sizeof(buffer) - 1) < 0) {
+                printf("Read failed: %s\n", strerror(errno));
+                close(client_fd);
+                exit(1);
             }
-        }
 
-        // Prepare response
-        char response[1024];
-        if (strcmp(path, "/") == 0) {
-            // Handle root path
-            snprintf(response, sizeof(response),
-                     "HTTP/1.1 200 OK\r\n"
-                     "Content-Length: 0\r\n"
-                     "\r\n");
-        } else if (strncmp(path, "/echo/", 6) == 0) {
-            // Handle /echo/{str}
-            char *echo_string = path + 6;
-            snprintf(response, sizeof(response),
-                     "HTTP/1.1 200 OK\r\n"
-                     "Content-Type: text/plain\r\n"
-                     "Content-Length: %ld\r\n"
-                     "\r\n"
-                     "%s",
-                     strlen(echo_string), echo_string);
-        } else if (strcmp(path, "/user-agent") == 0) {
-            // Handle /user-agent
-            if (user_agent[0] == '\0') {
-                // No User-Agent header found
+            // Parse request line
+            char method[16], path[256], protocol[16];
+            if (sscanf(buffer, "%s %s %s", method, path, protocol) != 3) {
+                printf("Failed to parse request line\n");
+                close(client_fd);
+                exit(1);
+            }
+
+            printf("Parsed request: Method=%s, Path=%s, Protocol=%s\n", method, path, protocol);
+
+            // Parse headers to find User-Agent
+            char user_agent[256] = {0};
+            char *header_line = buffer;
+            while (header_line) {
+                header_line = strstr(header_line, "\r\n");
+                if (!header_line) break;
+                header_line += 2; // Skip \r\n
+                if (strncmp(header_line, "User-Agent: ", 12) == 0) {
+                    strncpy(user_agent, header_line + 12, sizeof(user_agent) - 1);
+                    // Remove trailing \r\n
+                    char *newline = strstr(user_agent, "\r\n");
+                    if (newline) *newline = '\0';
+                    break;
+                }
+            }
+
+            // Prepare response
+            char response[1024];
+            if (strcmp(path, "/") == 0) {
+                // Handle root path
                 snprintf(response, sizeof(response),
-                         "HTTP/1.1 400 Bad Request\r\n"
+                         "HTTP/1.1 200 OK\r\n"
                          "Content-Length: 0\r\n"
                          "\r\n");
-            } else {
+            } else if (strncmp(path, "/echo/", 6) == 0) {
+                // Handle /echo/{str}
+                char *echo_string = path + 6;
                 snprintf(response, sizeof(response),
                          "HTTP/1.1 200 OK\r\n"
                          "Content-Type: text/plain\r\n"
                          "Content-Length: %ld\r\n"
                          "\r\n"
                          "%s",
-                         strlen(user_agent), user_agent);
+                         strlen(echo_string), echo_string);
+            } else if (strcmp(path, "/user-agent") == 0) {
+                // Handle /user-agent
+                if (user_agent[0] == '\0') {
+                    snprintf(response, sizeof(response),
+                             "HTTP/1.1 400 Bad Request\r\n"
+                             "Content-Length: 0\r\n"
+                             "\r\n");
+                } else {
+                    snprintf(response, sizeof(response),
+                             "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: text/plain\r\n"
+                             "Content-Length: %ld\r\n"
+                             "\r\n"
+                             "%s",
+                             strlen(user_agent), user_agent);
+                }
+            } else {
+                // Handle invalid paths
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 404 Not Found\r\n"
+                         "Content-Length: 0\r\n"
+                         "\r\n");
             }
+
+            // Send response
+            if (write(client_fd, response, strlen(response)) < 0) {
+                printf("Write failed: %s\n", strerror(errno));
+            }
+
+            // Close client and exit child
+            close(client_fd);
+            exit(0);
         } else {
-            // Handle invalid paths
-            snprintf(response, sizeof(response),
-                     "HTTP/1.1 404 Not Found\r\n"
-                     "Content-Length: 0\r\n"
-                     "\r\n");
+            // Parent process: Close client socket and clean up zombies
+            close(client_fd);
+            // Non-blocking wait to prevent zombie processes
+            while (waitpid(-1, NULL, WNOHANG) > 0);
         }
-
-        // Send response
-        if (write(client_fd, response, strlen(response)) < 0) {
-            printf("Write failed: %s\n", strerror(errno));
-        }
-
-        // Close client
-        close(client_fd);
     }
 
     close(server_fd);
