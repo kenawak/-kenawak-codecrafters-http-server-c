@@ -7,11 +7,16 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
-int main() {
+int main(int argc, char *argv[]) {
     // Disable output buffering
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+
+    // Get file directory from command-line argument
+    const char *file_dir = (argc > 1) ? argv[1] : ".";
 
     printf("Logs from your program will appear here!\n");
 
@@ -112,7 +117,7 @@ int main() {
             }
 
             // Prepare response
-            char response[1024];
+            char response[4096]; // Larger buffer for file contents
             if (strcmp(path, "/") == 0) {
                 // Handle root path
                 snprintf(response, sizeof(response),
@@ -145,6 +150,74 @@ int main() {
                              "%s",
                              strlen(user_agent), user_agent);
                 }
+            } else if (strncmp(path, "/files/", 7) == 0) {
+                // Handle /files/{filename}
+                char *filename = path + 7; // Skip "/files/"
+                char filepath[512];
+                snprintf(filepath, sizeof(filepath), "%s/%s", file_dir, filename);
+
+                // Open file
+                int file_fd = open(filepath, O_RDONLY);
+                if (file_fd < 0) {
+                    // File not found
+                    snprintf(response, sizeof(response),
+                             "HTTP/1.1 404 Not Found\r\n"
+                             "Content-Length: 0\r\n"
+                             "\r\n");
+                } else {
+                    // Get file size
+                    struct stat file_stat;
+                    if (fstat(file_fd, &file_stat) < 0) {
+                        printf("fstat failed: %s\n", strerror(errno));
+                        close(file_fd);
+                        snprintf(response, sizeof(response),
+                                 "HTTP/1.1 500 Internal Server Error\r\n"
+                                 "Content-Length: 0\r\n"
+                                 "\r\n");
+                    } else {
+                        // Read file contents
+                        off_t file_size = file_stat.st_size;
+                        char *file_content = malloc(file_size + 1);
+                        if (!file_content) {
+                            printf("Memory allocation failed\n");
+                            close(file_fd);
+                            snprintf(response, sizeof(response),
+                                     "HTTP/1.1 500 Internal Server Error\r\n"
+                                     "Content-Length: 0\r\n"
+                                     "\r\n");
+                        } else {
+                            ssize_t bytes_read = read(file_fd, file_content, file_size);
+                            if (bytes_read != file_size) {
+                                printf("Read file failed: %s\n", strerror(errno));
+                                free(file_content);
+                                close(file_fd);
+                                snprintf(response, sizeof(response),
+                                         "HTTP/1.1 500 Internal Server Error\r\n"
+                                         "Content-Length: 0\r\n"
+                                         "\r\n");
+                            } else {
+                                file_content[file_size] = '\0'; // Null-terminate for safety
+                                // Prepare response
+                                snprintf(response, sizeof(response),
+                                         "HTTP/1.1 200 OK\r\n"
+                                         "Content-Type: application/octet-stream\r\n"
+                                         "Content-Length: %ld\r\n"
+                                         "\r\n",
+                                         file_size);
+                                // Send headers
+                                if (write(client_fd, response, strlen(response)) < 0) {
+                                    printf("Write headers failed: %s\n", strerror(errno));
+                                }
+                                // Send file contents
+                                if (write(client_fd, file_content, file_size) < 0) {
+                                    printf("Write file content failed: %s\n", strerror(errno));
+                                }
+                                free(file_content);
+                                close(file_fd);
+                            }
+                        }
+                    }
+                }
             } else {
                 // Handle invalid paths
                 snprintf(response, sizeof(response),
@@ -153,9 +226,11 @@ int main() {
                          "\r\n");
             }
 
-            // Send response
-            if (write(client_fd, response, strlen(response)) < 0) {
-                printf("Write failed: %s\n", strerror(errno));
+            // Send response (if not already sent for /files/)
+            if (strncmp(path, "/files/", 7) != 0) {
+                if (write(client_fd, response, strlen(response)) < 0) {
+                    printf("Write failed: %s\n", strerror(errno));
+                }
             }
 
             // Close client and exit child
@@ -164,7 +239,6 @@ int main() {
         } else {
             // Parent process: Close client socket and clean up zombies
             close(client_fd);
-            // Non-blocking wait to prevent zombie processes
             while (waitpid(-1, NULL, WNOHANG) > 0);
         }
     }
